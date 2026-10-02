@@ -1,0 +1,78 @@
+name: Build severus container
+
+on:
+  push:
+    branches: ["container/whitelist"]
+  workflow_dispatch:
+
+env:
+  IMAGE: docker.io/amberverhasselt/severus
+  SIF_IMAGE: docker.io/amberverhasselt/severus-sif
+  # Commit of whitelist-reciprocal-corroboration that this branch's source corresponds to.
+  SEVERUS_SRC_COMMIT: 6813dee
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:1.7-whitelist-${{ env.SEVERUS_SRC_COMMIT }}
+            ${{ env.IMAGE }}:1.7-whitelist
+          build-args: |
+            SEVERUS_SRC_COMMIT=${{ env.SEVERUS_SRC_COMMIT }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: |
+          docker run --rm "${IMAGE}:1.7-whitelist-${SEVERUS_SRC_COMMIT}" severus --help | grep -q -- --whitelist-single-read
+          docker run --rm "${IMAGE}:1.7-whitelist-${SEVERUS_SRC_COMMIT}" severus --version | tee version.txt
+          grep -q '1.7' version.txt
+          docker run --rm "${IMAGE}:1.7-whitelist-${SEVERUS_SRC_COMMIT}" sh -c 'command -v bgzip && command -v tabix && command -v ps'
+
+  build-sif:
+    needs: build-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Set up Apptainer
+        uses: eWaterCycle/setup-apptainer@v2
+        with:
+          apptainer-version: 1.4.4
+
+      - name: Build SIF from the pushed OCI image
+        run: |
+          set -euo pipefail
+          apptainer build severus.sif "docker://${IMAGE}:1.7-whitelist-${SEVERUS_SRC_COMMIT}"
+          apptainer exec severus.sif severus --help | grep -q -- --whitelist-single-read
+          ls -lh severus.sif
+
+      - name: Push SIF to Docker Hub via ORAS
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | apptainer remote login --username "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin oras://docker.io
+          apptainer push severus.sif "oras://${SIF_IMAGE}:1.7-whitelist-${SEVERUS_SRC_COMMIT}"
+          apptainer push severus.sif "oras://${SIF_IMAGE}:1.7-whitelist"
+          echo "pushed oras://${SIF_IMAGE}:1.7-whitelist-${SEVERUS_SRC_COMMIT}"
